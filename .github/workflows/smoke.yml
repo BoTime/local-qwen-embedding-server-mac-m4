@@ -1,0 +1,107 @@
+name: smoke
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    env:
+      QWEN_API_KEY: smoke-test-key
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install mock-Ollama deps
+        run: pip install --quiet "fastapi==0.115.6" "uvicorn[standard]==0.32.1" "pydantic==2.10.3" "openai>=1.40"
+
+      - name: Start mock Ollama on host (0.0.0.0:11434)
+        run: |
+          nohup python3 tests/mock_ollama.py > mock_ollama.log 2>&1 &
+          for i in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:11434/v1/models >/dev/null && break
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:11434/v1/models
+
+      - name: Build and start API container (compose, api only)
+        run: |
+          docker compose up -d --build api
+          for i in $(seq 1 30); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/health || true)
+            [ "$code" = "200" ] && break
+            sleep 1
+          done
+
+      - name: /health
+        run: |
+          curl -fsS http://127.0.0.1:8080/health | tee /tmp/health.json
+          grep -q '"status":"ok"' /tmp/health.json
+          grep -q '"ollama":"reachable"' /tmp/health.json
+
+      - name: Auth — missing key returns 401
+        run: |
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/v1/models)
+          [ "$code" = "401" ] || (echo "expected 401, got $code"; exit 1)
+
+      - name: Auth — wrong key returns 401
+        run: |
+          code=$(curl -s -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer wrong' http://127.0.0.1:8080/v1/models)
+          [ "$code" = "401" ] || (echo "expected 401, got $code"; exit 1)
+
+      - name: /v1/models lists qwen3-embedding:0.6b
+        run: |
+          curl -fsS -H "Authorization: Bearer $QWEN_API_KEY" http://127.0.0.1:8080/v1/models \
+            | python -c "import json,sys; d=json.load(sys.stdin); ids=[m['id'] for m in d['data']]; assert 'qwen3-embedding:0.6b' in ids, ids; print(ids)"
+
+      - name: /v1/embeddings — single string returns 1024-dim vector
+        run: |
+          curl -fsS http://127.0.0.1:8080/v1/embeddings \
+            -H "Authorization: Bearer $QWEN_API_KEY" \
+            -H 'Content-Type: application/json' \
+            -d '{"model":"qwen3-embedding:0.6b","input":"hello world"}' \
+            | python -c "import json,sys; d=json.load(sys.stdin); assert len(d['data'])==1 and len(d['data'][0]['embedding'])==1024; print('OK', d['model'])"
+
+      - name: /v1/embeddings — batch input preserves order
+        run: |
+          curl -fsS http://127.0.0.1:8080/v1/embeddings \
+            -H "Authorization: Bearer $QWEN_API_KEY" \
+            -H 'Content-Type: application/json' \
+            -d '{"model":"qwen3-embedding:0.6b","input":["a","b","c"]}' \
+            | python -c "import json,sys; d=json.load(sys.stdin); assert len(d['data'])==3 and [x['index'] for x in d['data']]==[0,1,2]; print('OK')"
+
+      - name: Bad body returns 422
+        run: |
+          code=$(curl -s -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer $QWEN_API_KEY" \
+            -H 'Content-Type: application/json' -d '{}' \
+            http://127.0.0.1:8080/v1/embeddings)
+          [ "$code" = "422" ] || (echo "expected 422, got $code"; exit 1)
+
+      - name: OpenAI SDK compatibility
+        run: |
+          python - <<'PY'
+          import os
+          from openai import OpenAI
+          c = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key=os.environ["QWEN_API_KEY"])
+          v = c.embeddings.create(model="qwen3-embedding:0.6b", input="hello").data[0].embedding
+          assert len(v) == 1024, len(v)
+          print("OK", len(v))
+          PY
+
+      - name: Container logs (debug)
+        if: always()
+        run: |
+          echo "=== api ==="
+          docker logs qwen-embed-api || true
+          echo "=== mock_ollama ==="
+          cat mock_ollama.log || true
+
+      - name: Teardown
+        if: always()
+        run: docker compose down -v || true

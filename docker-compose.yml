@@ -1,0 +1,37 @@
+services:
+  api:
+    build: .
+    container_name: qwen-embed-api
+    environment:
+      - QWEN_API_KEY=${QWEN_API_KEY:-}
+      - QWEN_API_KEYS=${QWEN_API_KEYS:-}
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-qwen3-embedding:0.6b}
+      - RATE_LIMIT=${RATE_LIMIT:-100/minute}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "127.0.0.1:8080:8080"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/health',timeout=2).status==200 else 1)"
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+
+  cloudflared:
+    image: cloudflare/cloudflared
+    container_name: cloudflared
+    command: tunnel --no-autoupdate --config /etc/cloudflared/config.yml run
+    volumes:
+      - ./cloudflared/config.yml:/etc/cloudflared/config.yml:ro
+      - ${CLOUDFLARE_CREDS_FILE:?CLOUDFLARE_CREDS_FILE must be set in .env (path to ~/.cloudflared/<UUID>.json)}:/etc/cloudflared/credentials.json:ro
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped

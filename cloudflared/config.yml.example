@@ -1,0 +1,17 @@
+# Cloudflare named-tunnel config. Copy this file to `cloudflared/config.yml`
+# (gitignored) and edit the two marked fields. Don't change `credentials-file`
+# — that path is where docker-compose mounts your `~/.cloudflared/<UUID>.json`.
+#
+# Prerequisites (run once on the host):
+#   brew install cloudflared
+#   cloudflared tunnel login                                       # browser auth
+#   cloudflared tunnel create qwen-embed                           # writes ~/.cloudflared/<UUID>.json
+#   cloudflared tunnel route dns qwen-embed qwen-embed.example.com # set <UUID> + hostname below
+
+tunnel: qwen-embed                                  # <-- tunnel name (or UUID)
+credentials-file: /etc/cloudflared/credentials.json  # leave as-is
+
+ingress:
+  - hostname: qwen-embed.example.com                # <-- your routed hostname
+    service: http://api:8080
+  - service: http_status:404
